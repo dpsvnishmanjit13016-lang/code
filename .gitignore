@@ -1,0 +1,7 @@
+node_modules/
+data.json
+journal.json
+vapid.json
+push.json
+*_result.json
+cloudflared.exe

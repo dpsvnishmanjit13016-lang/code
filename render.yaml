@@ -1,0 +1,23 @@
+# One-click setup for Render (render.com): New → Blueprint → pick this repository.
+services:
+  - type: web
+    name: swingpulse
+    runtime: node
+    plan: starter            # always-on ($7/month). The free plan sleeps, which would stop scanning and picks.
+    region: singapore        # closest Render region to India
+    buildCommand: npm install --omit=dev
+    startCommand: node server.js
+    healthCheckPath: /healthz
+    envVars:
+      - key: DATA_DIR        # watchlist, trade history and notification settings are kept on the disk below
+        value: /var/data
+      - key: NO_TUNNEL
+        value: "1"
+      - key: APP_PASSWORD    # you choose this when you create the service
+        sync: false
+      - key: SECRET_KEY      # only for optional TradingView alerts
+        generateValue: true
+    disk:
+      name: swingpulse-data
+      mountPath: /var/data
+      sizeGB: 1

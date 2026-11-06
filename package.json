@@ -1,0 +1,17 @@
+{
+  "name": "swingpulse",
+  "version": "1.0.0",
+  "description": "Intraday swing signal app: BUY/SELL/EXIT popups from TradingView alerts",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "UNLICENSED",
+  "private": true,
+  "dependencies": {
+    "web-push": "^3.6.7"
+  }
+}

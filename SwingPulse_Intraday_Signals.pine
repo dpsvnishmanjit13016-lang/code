@@ -1,0 +1,208 @@
+//@version=6
+// SwingPulse Intraday Signals
+// Works on any NSE / BSE equity (and futures) on an intraday timeframe (3m, 5m, 15m).
+// Shows BUY / SELL signals with Entry, Stop-loss, Target 1, Target 2,
+// manages the trade (Target 1 -> move SL to entry, exits) and fires alert() popups.
+// Rule-based tool for study only. Not investment advice.
+indicator("SwingPulse Intraday Signals", shorttitle = "SwingPulse", overlay = true, max_labels_count = 500, max_lines_count = 500)
+
+// ───────────── Inputs ─────────────
+grpI     = "Signal rules"
+stLen    = input.int(10, "Supertrend ATR length", minval = 1, group = grpI)
+stMult   = input.float(3.0, "Supertrend factor", step = 0.1, group = grpI)
+fastLen  = input.int(9, "Fast EMA", minval = 1, group = grpI)
+slowLen  = input.int(21, "Slow EMA", minval = 2, group = grpI)
+rsiLen   = input.int(14, "RSI length", minval = 2, group = grpI)
+rsiBuy   = input.float(55, "RSI: buy only above", group = grpI)
+rsiSell  = input.float(45, "RSI: sell only below", group = grpI)
+volMult  = input.float(1.5, "Volume spike (last 3 candles) above x times average", step = 0.1, group = grpI)
+volLen   = input.int(20, "Volume average length", minval = 2, group = grpI)
+needRules = input.int(5, "Rules needed for a signal (out of 5)", minval = 3, maxval = 5, group = grpI)
+
+grpR     = "Risk"
+slMode   = input.string("Supertrend", "Stop-loss method", options = ["Supertrend", "ATR x 1.5", "Signal candle"], group = grpR)
+t1R      = input.float(1.0, "Target 1 (x risk)", step = 0.5, group = grpR)
+t2R      = input.float(2.0, "Target 2 (x risk)", step = 0.5, group = grpR)
+trailToEntry = input.bool(true, "Move stop-loss to entry after Target 1", group = grpR)
+
+grpT     = "Time (IST)"
+sessionTrade = input.session("0930-1445", "New signals only between", group = grpT)
+sqOffH   = input.int(15, "Square-off hour", minval = 9, maxval = 15, group = grpT)
+sqOffM   = input.int(15, "Square-off minute", minval = 0, maxval = 59, group = grpT)
+
+grpA     = "Alerts & display"
+alertFmt = input.string("Text", "Alert message format", options = ["Text", "JSON (webhook)"], group = grpA, tooltip = "Choose JSON (webhook) when sending alerts to the SwingPulse app")
+secretKey = input.string("change-me", "Secret key (same as the app server)", group = grpA)
+showTable = input.bool(true, "Show status panel", group = grpA)
+
+tz = "Asia/Kolkata"
+
+// ───────────── Indicators ─────────────
+[stLine, stDir] = ta.supertrend(stMult, stLen)
+stUp   = stDir < 0
+emaF   = ta.ema(close, fastLen)
+emaS   = ta.ema(close, slowLen)
+vwapV  = ta.vwap(hlc3)
+rsiV   = ta.rsi(close, rsiLen)
+volAvg = ta.sma(volume, volLen)
+atrV   = ta.atr(14)
+volRatio = volAvg > 0 ? volume / volAvg : 0.0
+volSpike = ta.highest(volRatio, 3) > volMult   // spike on this candle or one of the 2 before it
+
+upRules = (stUp ? 1 : 0) + (emaF > emaS ? 1 : 0) + (close > vwapV ? 1 : 0) + (rsiV > rsiBuy ? 1 : 0) + (volSpike ? 1 : 0)
+dnRules = (not stUp ? 1 : 0) + (emaF < emaS ? 1 : 0) + (close < vwapV ? 1 : 0) + (rsiV < rsiSell ? 1 : 0) + (volSpike ? 1 : 0)
+
+inSession     = not na(time(timeframe.period, sessionTrade, tz))
+sqTime        = timestamp(tz, year(time, tz), month(time, tz), dayofmonth(time, tz), sqOffH, sqOffM)
+pastSquareOff = time_close >= sqTime
+newDay        = ta.change(dayofmonth(time, tz)) != 0
+
+// ───────────── Helpers ─────────────
+px(float x) =>
+    str.tostring(x, format.mintick)
+
+stopFor(int side) =>
+    float s = na
+    if slMode == "Supertrend"
+        s := stLine
+    else if slMode == "ATR x 1.5"
+        s := close - side * 1.5 * atrV
+    else
+        s := side == 1 ? low : high
+    // keep the stop on the correct side of price
+    if side == 1 and (na(s) or s >= close)
+        s := close - atrV
+    if side == -1 and (na(s) or s <= close)
+        s := close + atrV
+    s
+
+// ───────────── Trade state ─────────────
+var int   pos      = 0      // 1 = long, -1 = short, 0 = flat
+var float entry    = na
+var float sl       = na
+var float t1       = na
+var float t2       = na
+var bool  t1Done   = false
+var int   entryBar = na
+var line  lnEntry  = na
+var line  lnSL     = na
+var line  lnT1     = na
+var line  lnT2     = na
+
+msg(string kind, string extra) =>
+    string m = ""
+    if alertFmt == "Text"
+        m := kind + " " + syminfo.ticker + " (" + timeframe.period + ") | Entry " + px(entry) + " | SL " + px(sl) + " | T1 " + px(t1) + " | T2 " + px(t2) + extra
+    else
+        m := '{"key":"' + secretKey + '","price":' + px(close) + ',"symbol":"' + syminfo.ticker + '","tf":"' + timeframe.period + '","event":"' + kind + '","entry":' + px(entry) + ',"sl":' + px(sl) + ',"t1":' + px(t1) + ',"t2":' + px(t2) + ',"note":"' + extra + '"}'
+    m
+
+bool   buySig  = false
+bool   sellSig = false
+bool   t1Ev    = false
+bool   exitEv  = false
+string exitWhy = ""
+
+// ───────────── Entries ─────────────
+canEnter = timeframe.isintraday and pos == 0 and inSession and not pastSquareOff and barstate.isconfirmed
+if canEnter and upRules >= needRules and upRules[1] < needRules
+    buySig := true
+else if canEnter and dnRules >= needRules and dnRules[1] < needRules
+    sellSig := true
+
+if buySig or sellSig
+    side = buySig ? 1 : -1
+    pos := side
+    entry := close
+    sl := stopFor(side)
+    risk = math.abs(entry - sl)
+    t1 := entry + side * risk * t1R
+    t2 := entry + side * risk * t2R
+    t1Done := false
+    entryBar := bar_index
+    lnEntry := line.new(bar_index, entry, bar_index + 1, entry, color = color.orange, style = line.style_dashed, width = 2)
+    lnSL    := line.new(bar_index, sl, bar_index + 1, sl, color = color.red, style = line.style_dashed, width = 2)
+    lnT1    := line.new(bar_index, t1, bar_index + 1, t1, color = color.green, style = line.style_dashed, width = 1)
+    lnT2    := line.new(bar_index, t2, bar_index + 1, t2, color = color.green, style = line.style_dashed, width = 2)
+    label.new(bar_index, side == 1 ? low : high, (side == 1 ? "BUY" : "SELL") + "\nEntry " + px(entry) + "\nSL " + px(sl) + "\nT1 " + px(t1) + "\nT2 " + px(t2), style = side == 1 ? label.style_label_up : label.style_label_down, color = side == 1 ? color.new(color.green, 0) : color.new(color.red, 0), textcolor = color.white, size = size.small)
+    alert(msg(side == 1 ? "BUY" : "SELL", ""), alert.freq_once_per_bar_close)
+
+// ───────────── Trade management / exits ─────────────
+if pos != 0 and bar_index > entryBar and barstate.isconfirmed
+    hitT1  = pos == 1 ? high >= t1 : low <= t1
+    hitT2  = pos == 1 ? high >= t2 : low <= t2
+    hitSL  = pos == 1 ? low <= sl : high >= sl
+    stFlip = pos == 1 ? not stUp : stUp
+    float exitPx = close
+    if hitSL
+        exitEv := true
+        exitWhy := t1Done and trailToEntry ? "Stop at entry" : "Stop-loss hit"
+        exitPx := sl
+    else if hitT2
+        exitEv := true
+        exitWhy := "Target 2 hit"
+        exitPx := t2
+    else if stFlip
+        exitEv := true
+        exitWhy := "Supertrend flipped"
+    else if pastSquareOff or newDay
+        exitEv := true
+        exitWhy := "Square-off time"
+
+    if not exitEv and not t1Done and hitT1
+        t1Done := true
+        t1Ev := true
+        label.new(bar_index, pos == 1 ? high : low, "T1 HIT\nBook 50%", style = pos == 1 ? label.style_label_down : label.style_label_up, color = color.new(color.teal, 0), textcolor = color.white, size = size.tiny)
+        alert(msg("TARGET 1 HIT", " | Book 50%" + (trailToEntry ? ", move SL to entry" : "")), alert.freq_once_per_bar_close)
+        if trailToEntry
+            sl := entry
+            line.set_y1(lnSL, sl)
+            line.set_y2(lnSL, sl)
+
+    if exitEv
+        pts = (exitPx - entry) * pos
+        ptsStr = (pts >= 0 ? "+" : "") + str.tostring(pts, "#.##") + " pts"
+        label.new(bar_index, pos == 1 ? high : low, "EXIT\n" + exitWhy + "\n" + ptsStr, style = pos == 1 ? label.style_label_down : label.style_label_up, color = color.new(color.blue, 0), textcolor = color.white, size = size.small)
+        alert(msg("EXIT", " | " + exitWhy + " | " + ptsStr), alert.freq_once_per_bar_close)
+        pos := 0
+        t1Done := false
+
+// keep level lines running while the trade is open
+if pos != 0
+    line.set_x2(lnEntry, bar_index)
+    line.set_x2(lnSL, bar_index)
+    line.set_x2(lnT1, bar_index)
+    line.set_x2(lnT2, bar_index)
+
+// ───────────── Plots ─────────────
+plot(emaF, "EMA fast", color = color.new(#4EA8FF, 0), linewidth = 2)
+plot(emaS, "EMA slow", color = color.new(#B48CFF, 0), linewidth = 2)
+plot(vwapV, "VWAP", color = color.new(color.gray, 0), linewidth = 2)
+plot(stUp ? stLine : na, "Supertrend up", color = color.green, linewidth = 2, style = plot.style_linebr)
+plot(not stUp ? stLine : na, "Supertrend down", color = color.red, linewidth = 2, style = plot.style_linebr)
+
+// Simple alert conditions (optional, for one alert per event type)
+alertcondition(buySig, "SwingPulse BUY", "SwingPulse BUY on {{ticker}} at {{close}}")
+alertcondition(sellSig, "SwingPulse SELL", "SwingPulse SELL on {{ticker}} at {{close}}")
+alertcondition(t1Ev, "SwingPulse Target 1", "SwingPulse Target 1 hit on {{ticker}} at {{close}}")
+alertcondition(exitEv, "SwingPulse EXIT", "SwingPulse EXIT on {{ticker}} at {{close}}")
+
+// ───────────── Status panel ─────────────
+var table tb = table.new(position.top_right, 2, 7, bgcolor = color.new(#0B0F14, 5), border_width = 1, border_color = color.new(#243140, 0))
+if showTable and barstate.islast
+    stateTxt = pos == 1 ? "LONG" : pos == -1 ? "SHORT" : "WAITING"
+    stateCol = pos == 1 ? color.lime : pos == -1 ? color.red : color.silver
+    table.cell(tb, 0, 0, "SwingPulse", text_color = color.white, text_size = size.small)
+    table.cell(tb, 1, 0, stateTxt, text_color = stateCol, text_size = size.small)
+    table.cell(tb, 0, 1, "Buy rules", text_color = color.silver, text_size = size.small)
+    table.cell(tb, 1, 1, str.tostring(upRules) + " / 5", text_color = color.lime, text_size = size.small)
+    table.cell(tb, 0, 2, "Sell rules", text_color = color.silver, text_size = size.small)
+    table.cell(tb, 1, 2, str.tostring(dnRules) + " / 5", text_color = color.red, text_size = size.small)
+    table.cell(tb, 0, 3, "Entry", text_color = color.silver, text_size = size.small)
+    table.cell(tb, 1, 3, pos != 0 ? px(entry) : "-", text_color = color.orange, text_size = size.small)
+    table.cell(tb, 0, 4, "Stop-loss", text_color = color.silver, text_size = size.small)
+    table.cell(tb, 1, 4, pos != 0 ? px(sl) : "-", text_color = color.red, text_size = size.small)
+    table.cell(tb, 0, 5, "Target 1", text_color = color.silver, text_size = size.small)
+    table.cell(tb, 1, 5, pos != 0 ? px(t1) : "-", text_color = color.lime, text_size = size.small)
+    table.cell(tb, 0, 6, "Target 2", text_color = color.silver, text_size = size.small)
+    table.cell(tb, 1, 6, pos != 0 ? px(t2) : "-", text_color = color.lime, text_size = size.small)
